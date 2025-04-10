@@ -6,85 +6,75 @@ using System.Collections.Generic;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
-using System.Windows;
+using ClosedXML.Excel;
 
 namespace CsvParameterUpdater
 {
-    public class Condition
-    {
-        public string Property { get; set; }
-        public string Comparer { get; set; }
-        public string Value { get; set; }
-    }
+    
 
     [Transaction(TransactionMode.Manual)]
     [Regeneration(RegenerationOption.Manual)]
     public class Command : IExternalCommand
     {
         /// <summary>
-        /// Основной метод для обновления параметров элементов по правилам из CSV-файла
+        /// Main method for updating element parameters based on rules from an Excel (.xlsx) file.
         /// </summary>
         /// <remarks>
-        /// Ожидаемая структура CSV-файла:
-        /// - Rule: Имя группы правил (группировка условий)
-        /// - Property: Свойство для фильтрации ("Category", "FamilyName")
-        /// - Comparer: Оператор сравнения ("equals", "contains")
-        /// - Value: Значение для сравнения
-        /// - Parameter: Имя параметра для обновления
-        /// - ParameterValue: Значение параметра для установки
+        /// Expected structure of the Excel file:
+        /// - Rule: Name of the rule group (used to group conditions)
+        /// - Property: Filtering property ("Category", "FamilyName", etc.)
+        /// - Comparer: Comparison operator ("equals", "contains")
+        /// - Value: Value to compare with
+        /// - Parameter: Name of the parameter to update
+        /// - ParameterValue: Value to assign to the parameter
         /// </remarks>
+
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
             UIApplication uiApp = commandData.Application;
             UIDocument uiDoc = uiApp.ActiveUIDocument;
             Document doc = uiDoc.Document;
 
-            var openDialog = new FileOpenDialog("CSV Files (*.csv)|*.csv");
-            openDialog.Title = "Выберите CSV файл с правилами";
+            var openDialog = new FileOpenDialog("Excel Files (*.xlsx)|*.xlsx");
+            openDialog.Title = "Выберите Excel файл с правилами";
 
             if (openDialog.Show() != ItemSelectionDialogResult.Confirmed)
                 return Result.Cancelled;
 
-            string csvPath = ModelPathUtils.ConvertModelPathToUserVisiblePath(openDialog.GetSelectedModelPath());
+            string xlsxPath = ModelPathUtils.ConvertModelPathToUserVisiblePath(openDialog.GetSelectedModelPath());
 
-            DataTable rulesTable = ReadCsvToDataTable(csvPath);
+            TaskDialog.Show("Debug", $"Excel path: {xlsxPath}");
 
-            if (rulesTable.Rows.Count == 0)
-                throw new InvalidOperationException("CSV файл не содержит правил");
+            if (string.IsNullOrEmpty(xlsxPath) || !File.Exists(xlsxPath))
+            {
+                TaskDialog.Show("Error", "Invalid or missing Excel file path.");
+                return Result.Cancelled;
+            }
+
+            var rules = ReadXlsxToRuleDefinition(xlsxPath);
+
+            if (rules.Count == 0)
+                throw new InvalidOperationException("Excel файл не содержит правил");
 
             using (Transaction trans = new Transaction(doc, "Update Parameters from Rules"))
             {
                 trans.Start();
 
-                var ruleGroups = rulesTable.AsEnumerable()
-                    .GroupBy(row => row.Field<string>("Rule"));
-
-                foreach (var ruleGroup in ruleGroups)
+                foreach (var rule in rules)
                 {
-                    var conditions = ruleGroup.Select(row => new Condition
-                    {
-                        Property = row.Field<string>("Property"),
-                        Comparer = row.Field<string>("Comparer"),
-                        Value = row.Field<string>("Value")
-                    }).ToList();
-
-                    var parameterUpdate = ruleGroup.First();
-                    string paramName = parameterUpdate.Field<string>("Parameter");
-                    string paramValue = parameterUpdate.Field<string>("ParameterValue");
-
-                    var filteredElements = FilterElementsByConditions(doc, conditions);
+                    var filteredElements = FilterElementsByConditions(doc, rule.Conditions);
 
                     if (filteredElements == null || !filteredElements.Any())
                     {
                         TaskDialog.Show("Информация",
-                            $"Не найдены элементы, соответствующие правилу: {ruleGroup.Key}\n" +
-                            $"Параметр: {paramName}, Значение: {paramValue}");
+                            $"Не найдены элементы, соответствующие правилу\n" +
+                            $"Параметр: {rule.ParameterName}, Значение: {rule.ParameterValue}");
                         continue;
                     }
 
                     foreach (Element elem in filteredElements)
                     {
-                        SetParameter(paramName, paramValue, elem);
+                        SetParameter(rule.ParameterName, rule.ParameterValue, elem);
                     }
                 }
 
@@ -96,17 +86,19 @@ namespace CsvParameterUpdater
         }
 
         /// <summary>
-        /// Фильтрует элементы в документе на основе заданных условий
-        /// Условия могут включать проверку категории (Category) или имени семейства (FamilyName)
-        /// с различными операторами сравнения (equals, contains)
+        /// Filters elements in the document based on the provided conditions.
+        /// Conditions can include checks for category (Category), family name (FamilyName),
+        /// and other properties using different comparison operators ("equals", "contains").
         /// </summary>
-        /// <param name="conditions">Список условий для фильтрации, где каждое условие содержит:
-        ///     Property - свойство для фильтрации ("Category" или "FamilyName"),
-        ///     Comparer - оператор сравнения ("equals" для точного определения, "contains" для частичного совпадения),
-        ///     Value - значение для сравнения (для Category - имя встроенной категории, для FamilyName - строка поиска)
+        /// <param name="conditions">
+        /// List of filtering conditions where each condition includes:
+        ///     Property - property to filter by ("Category", "FamilyName", etc.),
+        ///     Comparer - comparison operator ("equals" for exact match, "contains" for partial match),
+        ///     Value - value to compare with (e.g., category name, search string for FamilyName)
         /// </param>
-        /// <returns>Коллектор элементов с отфильтрованными элементами</returns>
-        private FilteredElementCollector FilterElementsByConditions(Document doc, List<Condition> conditions)
+        /// <returns>FilteredElementCollector containing the matching elements</returns>
+
+        public FilteredElementCollector FilterElementsByConditions(Document doc, List<Condition> conditions)
         {
             var collector = new FilteredElementCollector(doc).WhereElementIsNotElementType();
 
@@ -119,125 +111,128 @@ namespace CsvParameterUpdater
                 switch (property)
                 {
                     case "Category":
-                        collector = FilterByCategory(collector, doc, comparer, value);
+                        collector = Properties.FilterByCategory(collector, doc, comparer, value);
                         break;
 
                     case "FamilyName":
-                        collector = FilterByFamilyName(collector, comparer, value);
+                        collector = Properties.FilterByFamilyName(collector, comparer, value);
                         break;
+
+                    case "TypeName":
+                        collector = Properties.FilterByTypeName(collector, doc, comparer, value);
+                        break;
+
+                    case "Workset":
+                        collector = Properties.FilterByWorkset(collector, doc, comparer, value);
+                        break;
+
+                    //case "TextParameterValue":
+                    //    collector = Conditions.FilterByTextParameterValue(collector, doc, comparer, value, condition.ExtraInfo);
+                    //    break;
                 }
             }
 
             return collector;
         }
 
-        /// <summary>
-        /// Фильтрует элементы по категории с использованием указанного оператора сравнения
-        /// </summary>
-        /// <param name="comparer">Оператор сравнения:
-        ///     "equals" - точное совпадение с встроенной категорией
-        ///     "contains" - частичное совпадение с встроенной категорией</param>
-        /// <param name="value">Значение для сравнения:</param>
-        /// <returns>Коллектор элементов, отфильтрованный по категории</returns>
-        /// <remarks>
-        /// В текущей реализации поддерживается только оператор "equals" для встроенных категорий.
-        /// </remarks>
-        private FilteredElementCollector FilterByCategory(FilteredElementCollector collector,
-            Document doc, string comparer, string value)
-        {
-            if (comparer == "equals")
-            {
-                if (Enum.TryParse(value, out BuiltInCategory bic))
-                {
-                    return collector.OfCategory(bic);
-                }
-            }
-            //else if (comparer == "contains")
-            //{
-            //    var elements = collector.ToList();
-            //    return new FilteredElementCollector(doc, elements
-            //        .Where(e => e.Category?.Name?.Contains(value) == true)
-            //        .Select(e => e.Id)
-            //        .ToList());
-            //}
-
-            return collector;
-        }
 
         /// <summary>
-        /// Фильтрует элементы по имени семейства с использованием указанного оператора сравнения
+        /// Reads an XLSX file and converts it into a List<RuleDefinition>;
         /// </summary>
-        /// <param name="comparer">Оператор сравнения:
-        ///     "equals" - точное совпадение имени семейства,
-        ///     "contains" - частичное совпадение имени семейства</param>
-        /// <param name="value">Значение для сравнения (строка поиска для имени семейства)</param>
-        /// <returns>Коллектор элементов, отфильтрованный по имени семейства</returns>
-        /// <remarks>
-        /// Использует встроенный параметр ALL_MODEL_FAMILY_NAME для фильтрации.
-        /// Регистр символов не учитывается (case insensitive).
-        /// Для "equals" выполняется точное сравнение, для "contains" - поиск подстроки.
-        /// </remarks>
-        private FilteredElementCollector FilterByFamilyName(FilteredElementCollector collector,
-            string comparer, string value)
+        /// <param name="filePath">Path to the Excel file</param>
+        /// <returns>List<RuleDefinition> with rule data extracted from the file</returns>
+
+        private List<RuleDefinition> ReadXlsxToRuleDefinition(string filePath)
         {
-            if (comparer == "equals")
-            {
-                var rule = ParameterFilterRuleFactory.CreateEqualsRule(
-                    new ElementId(BuiltInParameter.ALL_MODEL_FAMILY_NAME),
-                    value,
-                    false);
-                return collector.WherePasses(new ElementParameterFilter(rule));
-            }
-            else if (comparer == "contains")
-            {
-                var rule = ParameterFilterRuleFactory.CreateContainsRule(
-                    new ElementId(BuiltInParameter.ALL_MODEL_FAMILY_NAME),
-                    value,
-                    false);
-                return collector.WherePasses(new ElementParameterFilter(rule));
-            }
+            var rules = new List<RuleDefinition>();
 
-            return collector;
-        }
-
-        /// <summary>
-        /// Читает CSV-файл и преобразует его в DataTable
-        /// </summary>
-        /// <param name="filePath">Путь к CSV-файлу</param>
-        /// <returns>DataTable с данными из CSV</returns>
-        private DataTable ReadCsvToDataTable(string filePath)
-        {
-            DataTable dt = new DataTable();
-
-            using (StreamReader sr = new StreamReader(filePath))
+            try
             {
-                string[] headers = sr.ReadLine().Split(';');
-                foreach (string header in headers)
+                using (var workbook = new XLWorkbook(filePath))
                 {
-                    dt.Columns.Add(header.Trim('"').Trim());
-                }
+                    var worksheet = workbook.Worksheet(1);
+                    var rows = worksheet.RowsUsed();
 
-                while (!sr.EndOfStream)
-                {
-                    string[] rows = sr.ReadLine().Split(';');
-                    DataRow dr = dt.NewRow();
-                    for (int i = 0; i < headers.Length && i < rows.Length; i++)
+                    if (rows.Count() < 2) return rules;
+
+                    var firstRow = rows.First();
+                    var ruleNames = new List<string>();
+                    int col = 3;
+
+                    while (col <= worksheet.LastColumnUsed().ColumnNumber())
                     {
-                        dr[i] = rows[i].Trim('"').Trim();
+                        var cell = firstRow.Cell(col);
+                        if (!string.IsNullOrWhiteSpace(cell.Value.ToString()))
+                        {
+                            ruleNames.Add(cell.Value.ToString());
+                            col += 3;
+                        }
+                        else
+                        {
+                            break;
+                        }
                     }
-                    dt.Rows.Add(dr);
+
+
+                    foreach (var row in rows.Skip(1))
+                    {
+                        string parameterName = row.Cell(1).Value.ToString().Trim();
+                        string parameterValue = row.Cell(2).Value.ToString().Trim();
+
+                        for (int ruleIndex = 0; ruleIndex < ruleNames.Count; ruleIndex++)
+                        {
+                            int valueIndex = 3 + (ruleIndex * 3);
+
+                            string property = row.Cell(valueIndex).Value.ToString().Trim();
+                            string comparer = row.Cell(valueIndex + 1).Value.ToString().Trim();
+                            string value = row.Cell(valueIndex + 2).Value.ToString().Trim();
+
+                            if (string.IsNullOrEmpty(property) ||
+                                string.IsNullOrEmpty(comparer) ||
+                                string.IsNullOrEmpty(value))
+                                continue;
+
+                            var rule = rules.FirstOrDefault(r =>
+                                r.ParameterName == parameterName &&
+                                r.ParameterValue == parameterValue);
+
+                            if (rule == null)
+                            {
+                                rule = new RuleDefinition
+                                {
+                                    ParameterName = parameterName,
+                                    ParameterValue = parameterValue,
+                                    Conditions = new List<Condition>()
+                                };
+                                rules.Add(rule);
+                            }
+
+                            rule.Conditions.Add(new Condition
+                            {
+                                Property = property,
+                                Comparer = comparer,
+                                Value = value
+                            });
+                        }
+                    }
                 }
             }
+            catch (Exception ex)
+            {
 
-            return dt;
+                TaskDialog.Show("Excel Error", $"Failed to read Excel file: {ex.Message}");
+                return rules;
+            }
+
+            return rules;
         }
 
         /// <summary>
-        /// Устанавливает значение параметра элемента с преобразованием типов (из Select)
+        /// Sets the value of an element's parameter with appropriate type conversion
         /// </summary>
-        /// <param name="parameterName">Имя параметра для установки</param>
-        /// <param name="value">Значение для установки (будет преобразовано в соответствующий тип)</param>
-        /// <param name="element">Элемент, параметр которого нужно изменить</param>
+        /// <param name="parameterName">Name of the parameter to set</param>
+        /// <param name="value">Value to assign (will be converted to the proper type)</param>
+        /// <param name="element">Element whose parameter will be modified</param>
         public static void SetParameter(string parameterName, object value, Element element)
         {
             try
@@ -288,5 +283,22 @@ namespace CsvParameterUpdater
                 TaskDialog.Show("Error", $"An error occurred setting parameter {parameterName} to a value of {value}.\n Error message: {e.Message}");
             }
         }
+    }
+    public class Condition
+    {
+        public string Property { get; set; }
+        public string Comparer { get; set; }
+        public string Value { get; set; }
+    }
+    public class RuleDefinition
+    {
+        public string ParameterName { get; set; }
+        public string ParameterValue { get; set; }
+        public List<Condition> Conditions { get; set; }
+    }
+    public class RuleGroup
+    {
+        public List<Condition> Conditions { get; set; }
+        public string LogicalOperator { get; set; }
     }
 }
